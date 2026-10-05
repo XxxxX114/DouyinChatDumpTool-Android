@@ -1,0 +1,10 @@
+# 核心依赖
+pycryptodome>=3.19.0
+
+# 说明：
+#   pycryptodome  解密 IM 库必需（AES-256-CBC）。
+#                 有 Windows / macOS / Linux 官方 wheel，pip 直接装，不用编译。
+#
+# 本工具**不需要** sqlcipher3 —— 解密是纯 Python 实现的 SQLCipher v3，
+# 因为抖音的库是 SQLCipher v3（HMAC-SHA1 / PBKDF2-SHA1 64000 / 4096 页），
+# 参数固定且口令可由文件名直接推出，没必要引入难编译的 sqlcipher3。
