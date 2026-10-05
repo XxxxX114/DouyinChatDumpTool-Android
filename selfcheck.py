@@ -60,72 +60,8 @@ def bad(name: str, detail: str = "") -> None:
     print(f"  [!! ] {name}" + (f"   {detail}" if detail else ""))
 
 
-# ── 1. 造明文样本 ──────────────────────────────────────────────────────
-def build_plain(path: str) -> None:
-    """造一个贴近真机的明文库。
+# ── 1. 造 reserve 布局 ────────────────────────────────────────────────
 
-    刻意还原真机上这几个容易踩坑的点：
-      · conversation_id 是 "0:1:<对方uid>:<自己uid>" 这种四段文本
-      · 对方 uid 在自己前面还是后面不固定（判定"我是谁"就靠这个）
-      · 群聊的 conversation_id 是一串纯数字
-      · 表情类消息 content 里没有可读文本，得靠 fts_search_msg_biz 补
-      · 有 deleted=1 的本地已删消息
-    """
-    if os.path.exists(path):
-        os.remove(path)
-    c = sqlite3.connect(path)
-    c.executescript("""
-        PRAGMA page_size=4096;
-        CREATE TABLE conversation_list(
-            conversation_id TEXT PRIMARY KEY, short_id INTEGER,
-            type INTEGER, member_count INTEGER, updated_time INTEGER);
-        CREATE TABLE conversation_core(
-            conversation_id TEXT PRIMARY KEY, name TEXT, icon TEXT);
-        CREATE TABLE msg(
-            msg_uuid TEXT PRIMARY KEY, msg_server_id INTEGER, conversation_id TEXT,
-            type INTEGER, sender INTEGER, content TEXT, deleted INTEGER,
-            created_time INTEGER);
-        CREATE TABLE fts_search_msg_biz(
-            msg_uuid TEXT, search_content TEXT, conversation_id TEXT,
-            order_index INTEGER, created_time INTEGER, type INTEGER,
-            aweme_type INTEGER);
-        CREATE TABLE participant(
-            user_id INTEGER, conversation_id TEXT, alias TEXT, sec_uid TEXT);
-    """)
-    convs = [(CONV_A, 2222, "老王", 1, 2), (CONV_B, 3333, "小张", 1, 2)]
-    c.executemany("INSERT INTO conversation_list VALUES(?,?,?,?,?)",
-                  [(cid, 1000 + i, t, mc, 1759600000 + i * 600)
-                   for i, (cid, _p, _n, t, mc) in enumerate(convs)])
-    c.executemany("INSERT INTO conversation_core VALUES(?,?,?)",
-                  [(cid, n, "http://x/%d.jpg" % i)
-                   for i, (cid, _p, n, _t, _mc) in enumerate(convs)])
-    c.executemany("INSERT INTO participant VALUES(?,?,?,?)",
-                  [(p, cid, None, "sec_" + str(p))
-                   for cid, p, _n, _t, _mc in convs])
-
-    rows, fts, mid = [], [], 1
-    for cid, peer, who, _t, _mc in convs:
-        for k in range(24):
-            me = (k % 2 == 0)
-            sender = ME_UID if me else peer
-            uuid = f"{cid}#{k:02d}"
-            if k == 5:                       # 表情：content 挖不出文本
-                content = '{"stickers":[{"display_name":"Hi","id":1}]}'
-                typ = 15
-                fts.append((uuid, "[表情] Hi", cid, mid, 1759600000 + mid * 60, typ, 0))
-            else:
-                content = f"[{who}] 第 {k + 1} 条测试消息"
-                typ = 7
-            rows.append((uuid, mid, cid, typ, sender, content,
-                         1 if k == 7 else 0, 1759600000 + mid * 60))
-            mid += 1
-    c.executemany("INSERT INTO msg VALUES(?,?,?,?,?,?,?,?)", rows)
-    c.executemany("INSERT INTO fts_search_msg_biz VALUES(?,?,?,?,?,?,?)", fts)
-    c.commit()
-    c.close()
-
-
-# ── 2. 造 reserve 布局 ────────────────────────────────────────────────
 def shift_page(page: bytes, hdr: int, reserve: int) -> bytearray:
     """把一页 b-tree 的内容区整体上移 reserve 字节（reserve=0 -> reserve=N）。
 
@@ -173,6 +109,7 @@ def shift_page(page: bytes, hdr: int, reserve: int) -> bytearray:
     return np_
 
 
+# ── 2. 造明文样本 ──────────────────────────────────────────────────────
 def build_plain(path: str, reserve: int = D.RESERVE) -> None:
     """造一个贴近真机的、**原生带 reserve 保留空间**的明文库。
 
@@ -228,6 +165,11 @@ def build_plain(path: str, reserve: int = D.RESERVE) -> None:
             aweme_type INTEGER);
         CREATE TABLE participant(
             user_id INTEGER, conversation_id TEXT, alias TEXT, sec_uid TEXT);
+        -- 联系人搜索索引的 content 影子表（真机里在 encrypted_im_biz_<uid>.db）
+        -- docid = 对方 uid；值是 "<名字> <名字> <拼音…>" 形态
+        CREATE TABLE fts_contact_index_table_content(
+            docid TEXT, c0fts_remark_name TEXT, c1fts_nick_name TEXT,
+            c2fts_dy_id TEXT);
     """)
     convs = [(CONV_A, 2222, "老王", 1, 2), (CONV_B, 3333, "小张", 1, 2)]
     c.executemany("INSERT INTO conversation_list VALUES(?,?,?,?,?)",
@@ -239,6 +181,12 @@ def build_plain(path: str, reserve: int = D.RESERVE) -> None:
     c.executemany("INSERT INTO participant VALUES(?,?,?,?)",
                   [(p, cid, None, "sec_" + str(p))
                    for cid, p, _n, _t, _mc in convs])
+    # 联系人索引：2222 -> 老王 / 抖音号 laowang_dy；3333 -> 小张（**故意不给
+    # 抖音号**，用来验证"查不到的抖音号"会被如实报告，而不是误命中别人）
+    c.executemany("INSERT INTO fts_contact_index_table_content VALUES(?,?,?,?)", [
+        ("2222", "老王 老王 lao wang laowang", "老王 老王 lao wang", "laowang_dy"),
+        ("3333", "小张 小张 xiao zhang xiaozhang", "小张 小张 xiao zhang", None),
+    ])
 
     rows, fts, mid = [], [], 1
     for cid, peer, who, _t, _mc in convs:
@@ -505,6 +453,41 @@ def main() -> int:
             ok("会话元信息正确", f"账号 {rd.account_of(CONV_A)} / 单聊")
         else:
             bad("会话元信息正确", f"账号 {rd.account_of(CONV_A)}")
+
+        # ---- 按抖音号选会话 ----
+        # 2222=老王(抖音号 laowang_dy)，3333=小张(没抖音号)
+        n_dy = rd.dy_id_of(CONV_A)
+        if n_dy == "laowang_dy" and rd.dy_id_of(CONV_B) == "":
+            ok("抖音号从联系人索引读出", f"老王={n_dy!r} 小张={rd.dy_id_of(CONV_B)!r}")
+        else:
+            bad("抖音号从联系人索引读出",
+                f"老王={n_dy!r} 小张={rd.dy_id_of(CONV_B)!r}")
+
+        hits = rd.convs_by_dy_id("laowang_dy")
+        if hits == [CONV_A]:
+            ok("按抖音号精确命中会话", f"laowang_dy -> {len(hits)} 个")
+        else:
+            bad("按抖音号精确命中会话", f"laowang_dy -> {hits}")
+
+        # 大小写、@ 前缀都应能命中
+        if rd.convs_by_dy_id("@LaoWang_DY") == [CONV_A]:
+            ok("抖音号匹配忽略大小写与 @")
+        else:
+            bad("抖音号匹配忽略大小写与 @",
+                f"@LaoWang_DY -> {rd.convs_by_dy_id('@LaoWang_DY')}")
+
+        # 多个抖音号：一个命中、一个不存在，要分开报告
+        got, miss = rd.match_dy_ids("laowang_dy,xiaozhang_dy")
+        if got == [CONV_A] and miss == ["xiaozhang_dy"]:
+            ok("多抖音号输入：命中与未命中分开", f"命中 {len(got)}，未找到 {miss}")
+        else:
+            bad("多抖音号输入：命中与未命中分开", f"got={got} miss={miss}")
+
+        # 查不到的抖音号必须返回空，绝不能误命中别人
+        if rd.convs_by_dy_id("nobody_here") == []:
+            ok("不存在的抖音号不误命中")
+        else:
+            bad("不存在的抖音号不误命中", f"{rd.convs_by_dy_id('nobody_here')}")
     except Exception as e:
         bad("读库解析正确", f"{type(e).__name__}: {e}")
         rd = None

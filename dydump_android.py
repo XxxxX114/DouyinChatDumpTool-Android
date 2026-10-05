@@ -17,6 +17,9 @@ dydump_android.py —— Android 抖音私信数据库 提取 / 解密 / 导出�
   %(prog)s all                    一条龙：probe -> pull -> decrypt -> export
   %(prog)s local                  数据已在 dump/：decrypt -> export
   %(prog)s export --format csv    换导出格式（html/csv/txt/json/md）
+  %(prog)s pick                   交互选账号 / 选会话导出
+  %(prog)s export --account 1234567890   只导这个登录账号下的会话
+  %(prog)s export --search 小张   按昵称 / 抖音号 / uid 关键词筛会话
 
 工作目录默认是脚本旁的 dump/，所有产物都落在那里，用 --src 改。
 仅限自有设备与自有账号。
@@ -914,6 +917,25 @@ def _fmt_ts(v) -> str:
     return str(v)
 
 
+def _fts_dy_id(s) -> str:
+    """从 FTS 索引里抠出抖音号。
+
+    抖音号（c2fts_dy_id）和昵称的形态不同：昵称会被写成"名字 名字 拼音分段…"，
+    而抖音号是一个完整 token，不带重复前缀。若直接套 `_fts_name`，
+    `laowang 2024` 这种合法抖音号会被截断成 `laowang`，所以这里单独处理：
+    抖音号本身不吃空格，取第一个空格前的整段即可。
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    return s.split(" ")[0].strip()
+
+
+def norm_dy_id(s) -> str:
+    """抖音号的归一化形式，用于比对：去 @、去空白、转小写。"""
+    return (s or "").strip().lstrip("@").strip().lower()
+
+
 def _fts_name(s) -> str:
     """从抖音 FTS 索引那串"名字 名字 拼音 拼音 …"里抠出原始名字。
 
@@ -964,7 +986,7 @@ def read_contact_index(con) -> dict[str, dict]:
                     continue
                 nick = _fts_name(d.get(c_nick)) if c_nick else ""
                 name = (_fts_name(d.get(c_rem)) if c_rem else "") or nick
-                dy = _fts_name(d.get(c_dy)) if c_dy else ""
+                dy = _fts_dy_id(d.get(c_dy)) if c_dy else ""
                 if name or dy:
                     out.setdefault(uid, {"name": name, "nickname": nick, "dy_id": dy})
         except Exception:
@@ -1077,7 +1099,7 @@ class Reader:
         for m in self.msgs:
             key = (m["account"], m["conv"])
             self._messages.setdefault(key, []).append(m)
-            m["conv_name"] = self.name_of(key)
+            m["conv_name"] = self.name_of(m["conv"])
             m["sender_name"] = ("我" if m["is_me"] else
                                 self.contacts.get((m["account"], m["sender"]), m["sender"]))
 
@@ -1301,7 +1323,9 @@ class Reader:
                 "type_name": MSG_TYPE.get(t, f"type={t}" if t is not None else ""),
                 "content": text,
                 "sender": sender,
-                "sender_name": "我" if sender == self_uid else (self.contacts.get(sender) or sender),
+                "sender_name": "我" if sender == self_uid else (
+                    self.contacts.get((self_uid, sender))
+                    or self.contacts.get(sender) or sender),
                 "is_me": bool(self_uid) and sender == self_uid,
                 "deleted": bool(c_del is not None
                                 and str(d.get(c_del) or "0") not in ("0", "", "None")),
@@ -1329,15 +1353,19 @@ class Reader:
         群聊用 conversation_core.name；单聊抖音本地没存对方昵称，
         就用 conversation_id 里那个"不是我"的 uid 去联系人索引里查。
         """
-        n = self.convs.get(conv)
+        # 群名存在 conversation_core.name 里，按 (账号, 会话id) 作用域存放
+        self_uid = self.conv_meta.get(conv, {}).get("account")
+        n = self.convs.get((self_uid, conv)) or self.convs.get(conv)
         if n:
             return n
         parts = str(conv).split(":")
         if len(parts) == 4:
-            self_uid = self.conv_meta.get(conv, {}).get("account")
             a, b = parts[2], parts[3]
             peer = b if a == self_uid else a
-            return self.contacts.get(peer) or peer or conv
+            # 联系人索引是带账号作用域的：(account, uid) -> 名字
+            return (self.contacts.get((self_uid, peer))
+                    or self.contacts.get(peer)
+                    or peer or conv)
         return f"会话 {conv}"
 
     def peer_of(self, conv: str) -> str:
@@ -1350,13 +1378,108 @@ class Reader:
         return b if a == self_uid else a
 
     def dy_id_of(self, conv: str) -> str:
-        return self.contact_dy.get(self.peer_of(conv), "")
+        peer = self.peer_of(conv)
+        if not peer:
+            return ""
+        self_uid = self.conv_meta.get(conv, {}).get("account")
+        return (self.contact_dy.get((self_uid, peer))
+                or self.contact_dy.get(peer) or "")
 
     def account_of(self, conv: str) -> str:
         return self.conv_meta.get(conv, {}).get("account", "") or ""
 
     def is_group(self, conv: str) -> bool:
         return self.conv_meta.get(conv, {}).get("type", 1) != 1
+
+    # -- 账号 / 会话筛选 --------------------------------------------------
+    def self_accounts(self) -> list[tuple[str, int, int]]:
+        """登录过的账号列表：[(uid, 会话数, 消息数), ...]，按消息数降序。
+
+        一个 uid 就是一个"自己的抖音号"。换过号、登录过多个账号时会有多条。
+        uid 为空串的是无法归属的库（按源库隔离的 unknown-*），单独收成一项。
+        """
+        convs_per_acct: dict[str, set] = {}
+        msgs_per_acct: Counter = Counter()
+        for m in self.msgs:
+            acct = m.get("account") or ""
+            msgs_per_acct[acct] += 1
+            convs_per_acct.setdefault(acct, set()).add(m["conv"])
+        return sorted(
+            ((a, len(convs_per_acct[a]), n) for a, n in msgs_per_acct.items()),
+            key=lambda t: -t[2])
+
+    def convs_of_account(self, account: str) -> list[tuple[str, int]]:
+        """某个账号下的会话 [(conv, 消息数), ...]，按消息数降序。"""
+        c = Counter(m["conv"] for m in self.msgs if (m.get("account") or "") == account)
+        return sorted(c.items(), key=lambda kv: -kv[1])
+
+    def label_of(self, conv: str) -> str:
+        """会话的一行描述，例如 `张三 · 抖音号 zhangsan · 单聊`。"""
+        bits = [self.name_of(conv)]
+        dy = self.dy_id_of(conv)
+        if dy:
+            bits.append(f"抖音号 {dy}")
+        peer = self.peer_of(conv)
+        if not self.is_group(conv) and peer:
+            bits.append(f"uid {peer}")
+        bits.append("群聊" if self.is_group(conv) else "单聊")
+        return " · ".join(bits)
+
+    def match_convs(self, keyword: str) -> list[str]:
+        """按关键词匹配会话：昵称 / 抖音号 / 对方 uid / 会话 id，子串命中即可。"""
+        kw = (keyword or "").strip().lower()
+        if not kw:
+            return []
+        hit = []
+        for cid, _ in self.talkers():
+            hay = [self.name_of(cid), self.dy_id_of(cid), self.peer_of(cid), cid]
+            if any(kw in str(h).lower() for h in hay if h):
+                hit.append(cid)
+        return hit
+
+    def convs_by_dy_id(self, dy_id: str) -> list[str]:
+        """按**对方的抖音号**精确找会话（忽略大小写和前后 @）。
+
+        抖音号是唯一标识，所以这里优先精确匹配；精确没命中再退回子串，
+        这样"输入抖音号"这个动作的结果是可预期、不会误伤别的会话的。
+        """
+        want = norm_dy_id(dy_id)
+        if not want:
+            return []
+        exact: list[str] = []
+        loose: list[str] = []
+        for cid, _ in self.talkers():
+            got = norm_dy_id(self.dy_id_of(cid))
+            if not got:
+                continue
+            if got == want:
+                exact.append(cid)
+            elif want in got:
+                loose.append(cid)
+        return exact or loose
+
+    def match_dy_ids(self, raw: str) -> tuple[list[str], list[str]]:
+        """输入一串抖音号（逗号/空格分隔），返回 (命中的会话, 没找到的抖音号)。
+
+        抖音号本身可能带 `.` `_` `-`，所以分隔符只认逗号、分号和空白，
+        不把点号当分隔符 —— 否则 `zhang.san` 会被拆成两个。
+        """
+        found: list[str] = []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for tok in re.split(r"[,;\s，；、]+", raw or ""):
+            tok = tok.strip().lstrip("@")
+            if not tok:
+                continue
+            hits = self.convs_by_dy_id(tok)
+            if hits:
+                for c in hits:
+                    if c not in seen:
+                        seen.add(c)
+                        found.append(c)
+            else:
+                missing.append(tok)
+        return found, missing
 
 
 # ==========================================================================
@@ -1567,16 +1690,23 @@ code{{background:#26262a}}}}
 
 
 def export(rd: Reader, src: str, fmt: str = "html", min_msgs: int = 1,
-           only: list[str] | None = None) -> None:
-    outdir = os.path.join(src, "export", fmt)
+           only: list[str] | None = None, outdir: str | None = None,
+           keyword: str | None = None) -> None:
+    outdir = outdir or os.path.join(src, "export", fmt)
     os.makedirs(outdir, exist_ok=True)
     talkers = rd.talkers()
     if only:
         want = set(only)
         talkers = [t for t in talkers if t[0] in want or rd.name_of(t[0]) in want]
+    if keyword:
+        kw = keyword.strip().lower()
+        keep = set(rd.match_convs(kw))
+        # 关键词也允许命中账号 uid —— 直接输自己的抖音号，导这个号下的全部会话
+        keep |= {t[0] for t in talkers if (rd.account_of(t[0]) or "").lower() == kw}
+        talkers = [t for t in talkers if t[0] in keep]
     talkers = [t for t in talkers if t[1] >= min_msgs]
     if not talkers:
-        die("没有满足条件的会话可导出（试试 --min-msgs 0）")
+        die("没有满足条件的会话可导出（试试 --min-msgs 0 或换个关键词）")
 
     log(f"共 {len(talkers)} 个会话，导出为 {fmt}")
     rows = []
@@ -1612,6 +1742,7 @@ MENU = """
     6) 只导出              换格式 html / csv / txt / json / md
     7) 下载 adb            platform-tools 自动解压到脚本旁
     8) 离线自检            selfcheck（不碰设备、不碰数据）
+    9) 选账号 / 选会话导出  只导指定抖音号，或只导某几个人的聊天记录
     0) 退出
 """
 
@@ -1637,6 +1768,201 @@ def _run_selfcheck() -> None:
         warn(f"自检没能跑起来: {e}")
 
 
+# ==========================================================================
+# 选账号 / 选会话导出
+# ==========================================================================
+def _load_reader(src: str, args) -> Reader:
+    """把 dump/ 下已解密的库读成 Reader。没有明文库就提示先解密。"""
+    plains = []
+    for root, _, files in os.walk(src):
+        for f in files:
+            if f.endswith(".plain.db"):
+                plains.append(os.path.join(root, f))
+    plains.extend(find_plain_dbs(src))
+    if not plains:
+        die("没有明文库。先跑『处理本地已有数据』或『一键全流程』把数据解出来。")
+    all_plains = plains
+    keep = [p for p in all_plains if _has_im_tables(p)]
+    if not keep:
+        die("没有可读的 IM 库")
+    rd = Reader(sorted(keep),
+                keep_deleted=not getattr(args, "no_deleted", False),
+                keep_noise=getattr(args, "keep_noise", False),
+                contact_paths=sorted(all_plains))
+    log(f"读到 {len(rd.msgs)} 条消息 / {len(rd.talkers())} 个会话")
+    return rd
+
+
+def _parse_picks(raw: str, n: int) -> list[int] | None:
+    """解析用户输入的选择：`1`、`1,3,5`、`1-4`、`all` / 回车（全选）。
+
+    返回 0 基索引列表；输入非法返回 None（调用方提示重来）。
+    """
+    s = (raw or "").strip().lower()
+    if s in ("", "all", "*", "a"):
+        return list(range(n))
+    if s in ("none", "no", "-", "0"):
+        return []
+    picked: list[int] = []
+    for part in re.split(r"[,\s]+", s):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            rng = range(a, b + 1)
+        elif part.isdigit():
+            rng = [int(part)]
+        else:
+            return None
+        for i in rng:
+            if not 1 <= i <= n:
+                return None
+            picked.append(i - 1)
+    return sorted(set(picked))
+
+
+def _ask_fmt(default: str = "html") -> str:
+    v = _ask(f"  导出格式 html/csv/txt/json/md [{default}]: ", default).lower()
+    return v if v in EXPORTERS else default
+
+
+def _pick_by_dy(rd: Reader, raw: str) -> tuple[list[str], list[str]]:
+    """按抖音号选会话，返回 (命中的会话, 没找到的抖音号)。
+
+    命中时会把每个抖音号对应到谁打印出来，让用户能核对再导出。
+    """
+    found, missing = rd.match_dy_ids(raw)
+    if found:
+        print()
+        print(f"   按抖音号命中 {len(found)} 个会话：")
+        for cid in found:
+            print(f"     · {rd.label_of(cid):<46s} {len(rd.messages(cid)):>6} 条")
+    return found, missing
+
+
+def _pick_flow(args) -> None:
+    """交互式：先选自己的账号，再在该账号内选会话，然后只导出选中的。"""
+    src = os.path.abspath(args.src)
+    rd = _load_reader(src, args)
+
+    # ── 第 1 步：选账号（自己的抖音号）──
+    accounts = rd.self_accounts()
+    chosen: str | None = None
+    multi = len(accounts) > 1
+    if multi:
+        print()
+        print("  " + "=" * 58)
+        print("   检测到多个登录账号，先选一个")
+        print("  " + "=" * 58)
+        for i, (acct, nconv, nmsg) in enumerate(accounts, 1):
+            who = acct or "（无法归属）"
+            print(f"    {i:>2}) 抖音号 {who:<22s} {nconv:>4} 个会话 / {nmsg:>6} 条消息")
+        print("     0) 不按账号筛，进入全部会话")
+        raw = _ask(f"  选一个 [0-{len(accounts)}]: ", "0")
+        if raw.strip() not in ("", "0"):
+            if not raw.strip().isdigit() or not 1 <= int(raw.strip()) <= len(accounts):
+                warn("输入不合法，按 0 处理（不筛账号）")
+            else:
+                chosen = accounts[int(raw.strip()) - 1][0]
+    elif accounts:
+        chosen = accounts[0][0]
+        log(f"登录账号：抖音号 {chosen or '（无法归属）'}")
+    else:
+        die("没有读到任何消息。")
+
+    # ── 第 2 步：选会话 ──
+    talkers = rd.convs_of_account(chosen) if chosen is not None else rd.talkers()
+    if not talkers:
+        die("该账号下没有会话。")
+    print()
+    print("  " + "=" * 58)
+    print(f"   共 {len(talkers)} 个会话" + (f"（账号 {chosen}）" if chosen else ""))
+    print("  " + "=" * 58)
+    # 会话多时先给个概览，避免刷屏
+    LIST_CAP = 60
+    show = talkers[:LIST_CAP]
+    for i, (cid, n) in enumerate(show, 1):
+        print(f"    {i:>3}) {rd.label_of(cid):<46s} {n:>6} 条")
+    if len(talkers) > LIST_CAP:
+        print(f"    … 另有 {len(talkers) - LIST_CAP} 个，用下面第 1 种方式直接输入抖音号最快")
+
+    print()
+    print("  ── 怎么选 ──────────────────────────────────────────")
+    print("   1) 直接输入对方的抖音号   ← 推荐，可一次输多个，逗号分隔")
+    print("        例如：zhangsan     或  zhangsan,laowang_dy,123456")
+    print("   2) 输入序号（仅上表列出的）  例如：1,3,5  或  2-6")
+    print("   3) 输入昵称 / uid 关键词    例如：小张")
+    print("      （直接回车 = 全部导出）")
+    raw = _ask("  输入抖音号 / 序号 / 关键词: ", "")
+    raw = raw.strip()
+
+    sel: list[str] = []
+    if not raw:
+        sel = [cid for cid, _ in talkers]                      # 回车 = 全部
+    elif re.fullmatch(r"[\d,\s\-]+", raw):
+        # 纯数字（可含逗号/短横线）先当序号解析；解析不了再当抖音号试
+        picked = _parse_picks(raw, len(talkers))
+        if picked is not None and picked:
+            sel = [talkers[i][0] for i in picked]
+        else:
+            sel, missing = _pick_by_dy(rd, raw)
+            if not sel:
+                warn(f"既不是有效序号，也没找到抖音号：{missing or raw}")
+                return
+    else:
+        # 含字母/下划线 -> 当抖音号；否则当昵称关键词（两路都试，取并集）
+        sel, missing = _pick_by_dy(rd, raw)
+        if not sel:
+            hits = rd.match_convs(raw)
+            if not hits:
+                warn(f"没有找到抖音号「{raw}」，也没有匹配的会话")
+                return
+            if len(hits) == 1:
+                # 唯一命中就别再追问一遍，直接用
+                sel = hits
+                print()
+                print(f"   按昵称匹配到唯一会话：{rd.label_of(sel[0])}")
+            else:
+                print()
+                print(f"   按昵称/关键词匹配到 {len(hits)} 个（没找到抖音号：{'、'.join(missing)}）：")
+                for i, cid in enumerate(hits, 1):
+                    print(f"    {i:>3}) {rd.label_of(cid):<46s} {len(rd.messages(cid)):>6} 条")
+                sub = _ask("  选 [回车=全部匹配]: ", "")
+                picks2 = _parse_picks(sub, len(hits))
+                if picks2 is None:
+                    warn("输入不合法，已取消")
+                    return
+                sel = [hits[i] for i in picks2]
+        elif missing:
+            warn(f"这些抖音号没找到（可能是没互关 / 没聊过）：{'、'.join(missing)}")
+
+    if not sel:
+        warn("没有选中任何会话，已取消")
+        return
+
+    fmt = _ask_fmt(getattr(args, "format", "html") or "html")
+    outdir = os.path.join(src, "export", "picked", fmt)
+    log(f"准备导出 {len(sel)} 个会话 -> {os.path.relpath(outdir, src)}")
+    export(rd, src, fmt, min_msgs=0, only=sel, outdir=outdir)
+    _open_dir(outdir)
+
+
+def _open_dir(path: str) -> None:
+    """尽量帮用户把结果目录打开。打不开就算了，不影响导出。"""
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception:
+        pass
+
+
 def interactive(args) -> None:
     while True:
         print()
@@ -1644,12 +1970,21 @@ def interactive(args) -> None:
         print("   Android 抖音私信 提取 / 解密 / 导出")
         print("  " + "=" * 58)
         print(MENU)
-        c = _ask("  选一个 [0-8]: ")
+        c = _ask("  选一个 [0-9]: ")
         print()
         if c in ("0", "q", "Q", ""):
             return
         if c == "8":
             _run_selfcheck()
+            _ask("\n  回车继续 ...")
+            continue
+        if c == "9":
+            try:
+                _pick_flow(args)
+            except SystemExit:
+                pass
+            except Exception as e:
+                warn(f"执行出错: {e}")
             _ask("\n  回车继续 ...")
             continue
         mapping = {
@@ -1683,7 +2018,7 @@ def main() -> None:
     ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("step", nargs="?", default=None,
                     choices=["doctor", "adb", "probe", "pull", "pull-sd", "stream",
-                             "decrypt", "export", "local", "all"],
+                             "decrypt", "export", "local", "all", "pick"],
                     help="要执行的步骤；不填就进交互菜单")
     ap.add_argument("--src", default=WORK, help=f"工作目录（默认 {WORK}）")
     ap.add_argument("--from", dest="remote", default=SD_STAGE,
@@ -1700,6 +2035,12 @@ def main() -> None:
                     help="不导出本地已删除的消息（默认导出并标记）")
     ap.add_argument("--keep-noise", action="store_true",
                     help="保留在线状态/已读回执这类无内容的系统消息（默认丢弃）")
+    ap.add_argument("--account", dest="account",
+                    help="只导出该登录账号（自己的抖音号 uid）下的会话")
+    ap.add_argument("--search", dest="search",
+                    help="按昵称/抖音号/uid 关键词筛会话；也可直接填自己的抖音号")
+    ap.add_argument("--dy-id", dest="dy_ids",
+                    help="按对方抖音号精确导出，多个用逗号分隔，如 zhangsan,laowang_dy")
     args = ap.parse_args()
 
     if args.step is None:
@@ -1726,7 +2067,7 @@ def run(step: str, args) -> None:
     args.remote = fix_remote_path(args.remote)
     log(f"工作目录: {src}")
 
-    if step in ("decrypt", "export", "local", "all") and not _dep_ok("Crypto"):
+    if step in ("decrypt", "export", "local", "all", "pick") and not _dep_ok("Crypto"):
         die("缺少 pycryptodome，无法解密。\n"
             f"    装一下：{_pip_hint(['-r', 'requirements.txt'])}\n"
             f"    完整自检：python {os.path.basename(__file__)} doctor")
@@ -1738,6 +2079,10 @@ def run(step: str, args) -> None:
         if adb is None:
             adb = Adb(args.su_path).detect()
         return adb
+
+    if step == "pick":
+        _pick_flow(args)
+        return
 
     if step == "stream":
         stream(get_adb(), src, args.port, args.timeout)
@@ -1791,7 +2136,40 @@ def run(step: str, args) -> None:
             log(f"跳过无内容系统消息 {rd.noise_skipped} 条（--keep-noise 可保留）")
         if rd.dupes_skipped:
             log(f"去重 {rd.dupes_skipped} 条（主库/sub 库有重叠）")
-        export(rd, src, args.format, args.min_msgs)
+
+        # --account / --search / --dy-id 收窄导出范围
+        only = None
+        acct = getattr(args, "account", None)
+        if acct:
+            acct = acct.strip()
+            if acct not in {a for a, _, _ in rd.self_accounts()}:
+                avail = "、".join(a or "(无法归属)" for a, _, _ in rd.self_accounts())
+                warn(f"没有账号 {acct}，现有账号：{avail}")
+            else:
+                only = [cid for cid, _ in rd.convs_of_account(acct)]
+                log(f"限定账号 {acct}：{len(only)} 个会话")
+
+        # --dy-id：按对方抖音号精确指定，多个逗号分隔
+        dy_raw = getattr(args, "dy_ids", None)
+        if dy_raw:
+            hits, missing = rd.match_dy_ids(dy_raw)
+            if missing:
+                warn(f"这些抖音号没找到：{'、'.join(missing)}")
+            if not hits:
+                die(f"没有匹配的抖音号：{dy_raw}")
+            for cid in hits:
+                log(f"  抖音号命中: {rd.label_of(cid)}（{len(rd.messages(cid))} 条）")
+            hit_set = set(hits)
+            only = ([c for c in only if c in hit_set] if only else hits)
+            if not only:
+                die("抖音号命中的会话都不在 --account 指定的账号下")
+
+        kw = getattr(args, "search", None)
+        outdir = None
+        if kw or only or dy_raw:
+            outdir = os.path.join(src, "export", "picked", args.format)
+        export(rd, src, args.format, args.min_msgs, only=only, outdir=outdir,
+               keyword=kw)
 
 
 if __name__ == "__main__":
