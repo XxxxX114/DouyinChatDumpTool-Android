@@ -37,11 +37,14 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import zipfile
 from collections import Counter, OrderedDict
+from pathlib import Path
+from urllib.parse import quote
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(HERE, "dump")
@@ -332,9 +335,10 @@ def uid_from_name(name: str) -> str | None:
         encrypted_mi_pigeon_<uid>_aid1383_im.db
     """
     base = os.path.basename(name)
-    for pat in (r"encrypted_im_biz_(\d+)",
-                r"encrypted_mi_pigeon_(\d+)",
-                r"encrypted_(?:sub_)?(\d+)"):
+    for pat in (r"^encrypted_im_biz_(\d+)(?=[_.])",
+                r"^(?:encrypted_)?mi_pigeon_(\d+)(?=[_.])",
+                r"^(?:sub_)?encrypted_(?:sub_)?(\d+)(?=[_.])",
+                r"^(\d+)_im(?:[_.]|$)"):
         m = re.search(pat, base)
         if m:
             return m.group(1)
@@ -958,10 +962,11 @@ def read_contact_index(con) -> dict[str, dict]:
                 uid = str(d.get(c_doc))
                 if not uid or uid == "None":
                     continue
-                name = _fts_name(d.get(c_rem)) or _fts_name(d.get(c_nick))
+                nick = _fts_name(d.get(c_nick)) if c_nick else ""
+                name = (_fts_name(d.get(c_rem)) if c_rem else "") or nick
                 dy = _fts_name(d.get(c_dy)) if c_dy else ""
                 if name or dy:
-                    out.setdefault(uid, {"name": name, "dy_id": dy})
+                    out.setdefault(uid, {"name": name, "nickname": nick, "dy_id": dy})
         except Exception:
             continue
     return out
@@ -1015,11 +1020,14 @@ class Reader:
                  keep_noise: bool = False, contact_paths: list[str] | None = None):
         import sqlite3
 
-        self.convs: dict[str, str] = {}        # conversation_id -> 显示名
-        self.conv_meta: dict[str, dict] = {}   # conversation_id -> 元信息
-        self.contacts: dict[str, str] = {}     # uid -> 昵称/备注
-        self.contact_dy: dict[str, str] = {}   # uid -> 抖音号
-        self.accounts: dict[str, str] = {}     # 明文库名 -> 登录 uid
+        # 会话、联系人、去重都必须带账号作用域；同一群在多个账号下不能合并。
+        self.convs: dict[tuple[str, str], str] = {}
+        self.conv_meta: dict[tuple[str, str], dict] = {}
+        self.contacts: dict[tuple[str, str], str] = {}
+        self.contact_dy: dict[tuple[str, str], str] = {}
+        self.contact_nicks: dict[tuple[str, str], str] = {}
+        self.accounts: dict[str, str] = {}     # 明文库绝对路径 -> 登录 uid / unknown-标识
+        self._messages: dict[tuple[str, str], list[dict]] = {}
         self.msgs: list[dict] = []
         self.deleted_skipped = 0
         self.noise_skipped = 0
@@ -1030,39 +1038,56 @@ class Reader:
 
         # 先扫联系人索引。它藏在 im_biz 那种没有 msg 表的元数据库里，
         # 不先拿到手，会话名就只能显示成一串 uid。
-        for p in list(contact_paths or []) + list(paths):
-            base = os.path.basename(p)
+        for p in dict.fromkeys(list(contact_paths or []) + list(paths)):
             try:
-                con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+                con = sqlite3.connect(Path(p).resolve().as_uri() + "?mode=ro", uri=True)
                 con.text_factory = lambda b: b.decode("utf-8", "replace")
             except Exception:
                 continue
             try:
+                account = self._account_for(con, p)
                 for uid, info in read_contact_index(con).items():
+                    key = (account, uid)
                     if info.get("name"):
-                        self.contacts.setdefault(uid, info["name"])
+                        self.contacts.setdefault(key, info["name"])
+                    if info.get("nickname"):
+                        self.contact_nicks.setdefault(key, info["nickname"])
                     if info.get("dy_id"):
-                        self.contact_dy.setdefault(uid, info["dy_id"])
+                        self.contact_dy.setdefault(key, info["dy_id"])
             finally:
                 con.close()
 
         for p in paths:
             base = os.path.basename(p)
             try:
-                con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+                con = sqlite3.connect(Path(p).resolve().as_uri() + "?mode=ro", uri=True)
                 con.text_factory = lambda b: b.decode("utf-8", "replace")
             except Exception as e:
                 warn(f"打开 {base} 失败: {e}")
                 continue
             self._src.append(base)
             try:
-                self._load(con, base, keep_deleted, keep_noise)
+                self._load(con, p, keep_deleted, keep_noise)
             except Exception as e:
                 warn(f"{base} 读取中断: {type(e).__name__}: {e}")
             finally:
                 con.close()
 
         self.msgs.sort(key=lambda m: (m.get("ts_raw") or 0, m.get("_seq", 0)))
+        for m in self.msgs:
+            key = (m["account"], m["conv"])
+            self._messages.setdefault(key, []).append(m)
+            m["conv_name"] = self.name_of(key)
+            m["sender_name"] = ("我" if m["is_me"] else
+                                self.contacts.get((m["account"], m["sender"]), m["sender"]))
+
+    def _account_for(self, con, path: str) -> str:
+        uid = self._self_uid(con, os.path.basename(path))
+        if uid:
+            return uid
+        # 无法可靠归属时按源库隔离，不能把所有未知账号混为一个。
+        canonical = os.path.normcase(os.path.realpath(path))
+        return "unknown-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
     # -- 内部 ------------------------------------------------------------
     def _tables_of(self, con) -> list[str]:
@@ -1085,22 +1110,22 @@ class Reader:
         出现的那个 uid 就是自己**（单聊里自己既可能在前也可能在后）。
         """
         hint = uid_from_name(base)
+        if hint:
+            return hint
         try:
             p3, p4 = Counter(), Counter()
             for (cid,) in con.execute("SELECT conversation_id FROM conversation_list"):
                 parts = str(cid).split(":")
-                if len(parts) == 4:
+                if (len(parts) == 4 and parts[:2] == ["0", "1"]
+                        and parts[2].isdigit() and parts[3].isdigit()):
                     p3[parts[2]] += 1
                     p4[parts[3]] += 1
             both = set(p3) & set(p4)
-            if both:
-                guess = max(both, key=lambda u: p3[u] + p4[u])
-                if hint and hint in both:
-                    return hint
-                return guess
+            if len(both) == 1:
+                return next(iter(both))
         except Exception:
             pass
-        return hint
+        return None
 
     def _search_index(self, con, tables: list[str]) -> dict[str, str]:
         """msg_uuid -> 可读文本。抖音把这条索引单独放一张表里。"""
@@ -1124,12 +1149,13 @@ class Reader:
                 continue
         return idx
 
-    def _load(self, con, base: str, keep_deleted: bool, keep_noise: bool) -> None:
+    def _load(self, con, path: str, keep_deleted: bool, keep_noise: bool) -> None:
+        base = os.path.basename(path)
         tables = self._tables_of(con)
         self._tables.extend(tables)
-        self_uid = self._self_uid(con, base)
-        if self_uid:
-            self.accounts[base] = self_uid
+        account = self._account_for(con, path)
+        self_uid = None if account.startswith("unknown-") else account
+        self.accounts[os.path.abspath(path)] = account
 
         # 1) 会话：名字 + 类型 + 成员数
         meta_tabs = {}
@@ -1145,7 +1171,7 @@ class Reader:
                 try:
                     for i, n in con.execute(f'SELECT "{cid}", "{nm}" FROM "{t}"'):
                         if i is not None and n and str(n).strip():
-                            self.convs[str(i)] = str(n).strip()
+                            self.convs[(account, str(i))] = str(n).strip()
                 except Exception:
                     pass
             ctype = _pick(cols, ["type", "conversation_type", "conv_type"])
